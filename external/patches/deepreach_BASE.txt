@@ -1,0 +1,1 @@
+Base: upstream smlbansal/deepreach @ a8127aa (public_release merge). Patch = local branch lvfm/modifications (commit 876e807) (exact_conservative model, ported dynamics, conservative loss) excluding runs/. Generated 2026-09-01.

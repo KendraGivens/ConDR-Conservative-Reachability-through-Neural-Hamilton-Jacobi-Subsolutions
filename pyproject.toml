@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "learning_value_function_manifold"
+version = "0.1.0"
+authors = [
+  {name="Anonymous Author", email="anonymous@example.com"},
+]
+description = "Conservative neural Hamilton-Jacobi reachability: exact non-positive correction + complementarity loss"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Previously declared lightning[pytorch-extra] (imported nowhere) and omitted
+# almost everything the code actually imports, while `license = {file="LICENSE"}`
+# pointed at a file that did not exist -- so `pip install .` failed outright
+# (audit P3-5).
+dependencies = [
+  "torch >= 2.5.0",
+  "torchdiffeq >= 0.2.3",
+  "numpy >= 1.24",
+  "scipy >= 1.10",
+  "pyyaml >= 6.0",
+  "matplotlib >= 3.7",
+  "tqdm >= 4.65",
+]
+
+[project.optional-dependencies]
+# Classical HJ ground truth, used for post-hoc EVALUATION only (never in training).
+groundtruth = [
+  "jax >= 0.4.20",
+  "hj-reachability >= 0.7.0",
+]
+dev = [
+  "pytest >= 7.4",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/anonymous/Learning_Value_Function_Manifold"
+"Bug Tracker" = "https://github.com/anonymous/Learning_Value_Function_Manifold/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

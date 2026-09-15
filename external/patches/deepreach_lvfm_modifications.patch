@@ -1,0 +1,299 @@
+diff --git a/dynamics/dynamics.py b/dynamics/dynamics.py
+index 99bf5b6..219acdc 100644
+--- a/dynamics/dynamics.py
++++ b/dynamics/dynamics.py
+@@ -28,6 +28,8 @@ class Dynamics(ABC):
+         self.value_var = value_var
+         self.value_normto = value_normto
+         self.deepreach_model = deepreach_model
++        # shift for the conservative nonpositive correction (exact_conservative)
++        self.conservative_shift = -8.0
+         assert self.loss_type in ['brt_hjivi', 'brat_hjivi'], f'loss type {self.loss_type} not recognized'
+         if self.loss_type == 'brat_hjivi':
+             assert callable(self.reach_fn) and callable(self.avoid_fn)
+@@ -57,6 +59,12 @@ class Dynamics(ABC):
+             return (output * self.value_var / self.value_normto) + self.boundary_fn(self.input_to_coord(input)[..., 1:])
+         elif self.deepreach_model=="exact":
+             return (output * input[..., 0] * self.value_var / self.value_normto) + self.boundary_fn(self.input_to_coord(input)[..., 1:])
++        elif self.deepreach_model=="exact_conservative":
++            # Nonpositive correction: rho(o) = -softplus(o + shift) <= 0, so
++            # V = g + tau*c*rho(o) <= g exactly, for all tau >= 0 (obstacle
++            # branch of the HJI VI satisfied by construction).
++            rho = -torch.nn.functional.softplus(output + self.conservative_shift)
++            return (rho * input[..., 0] * self.value_var / self.value_normto) + self.boundary_fn(self.input_to_coord(input)[..., 1:])
+         else:
+             return (output * self.value_var / self.value_normto) + self.value_mean
+ 
+@@ -71,6 +79,19 @@ class Dynamics(ABC):
+             state = self.input_to_coord(input)[..., 1:]
+             dvds_term2 = diff_operators.jacobian(self.boundary_fn(state).unsqueeze(dim=-1), state)[0].squeeze(dim=-2)
+             dvds = dvds_term1 + dvds_term2
++        elif self.deepreach_model=="exact_conservative":
++            # V = g + tau*c*rho(o);  rho' = -sigmoid(o + shift)
++            rho = -torch.nn.functional.softplus(output + self.conservative_shift)
++            rho_prime = -torch.sigmoid(output + self.conservative_shift)
++            dvdt = (self.value_var / self.value_normto) * \
++                (input[..., 0]*rho_prime*dodi[..., 0] + rho)
++            dvds_term1 = (self.value_var / self.value_normto /
++                          self.state_var.to(device=dodi.device)) * \
++                rho_prime.unsqueeze(-1) * dodi[..., 1:] * input[..., 0].unsqueeze(-1)
++            state = self.input_to_coord(input)[..., 1:]
++            dvds_term2 = diff_operators.jacobian(self.boundary_fn(
++                state).unsqueeze(dim=-1), state)[0].squeeze(dim=-2)
++            dvds = dvds_term1 + dvds_term2
+         elif self.deepreach_model=="exact":
+             dvdt = (self.value_var / self.value_normto) * \
+                 (input[..., 0]*dodi[..., 0] + output)
+@@ -1173,3 +1194,162 @@ class MultiVehicleCollision(Dynamics):
+             'y_axis_idx': 1,
+             'z_axis_idx': 6,
+         }
++
++
++class Air6DJoint(Dynamics):
++    """Full 6D joint-state two-vehicle collision avoidance.
++
++    The unreduced form of the Air3D game: pursuer and evader Dubins vehicles
++    with joint state [x_p, y_p, th_p, x_e, y_e, th_e]. Evader turn rate is the
++    control (maximizing, avoid), pursuer turn rate is the disturbance.
++    Parameters match the Air3D benchmark: velocity 0.75, |u|,|d| <= omega_max,
++    collision radius collisionR.
++    """
++    def __init__(self, collisionR:float, velocity:float, omega_max:float, angle_alpha_factor:float):
++        self.collisionR = collisionR
++        self.velocity = velocity
++        self.omega_max = omega_max
++        self.angle_alpha_factor = angle_alpha_factor
++        super().__init__(
++            loss_type='brt_hjivi', set_mode='avoid',
++            state_dim=6, input_dim=7, control_dim=1, disturbance_dim=1,
++            state_mean=[0, 0, 0, 0, 0, 0],
++            state_var=[1, 1, self.angle_alpha_factor*math.pi, 1, 1, self.angle_alpha_factor*math.pi],
++            value_mean=0.25,
++            value_var=0.5,
++            value_normto=0.02,
++            deepreach_model="exact",
++        )
++
++    def state_test_range(self):
++        return [
++            [-1, 1],
++            [-1, 1],
++            [-math.pi, math.pi],
++            [-1, 1],
++            [-1, 1],
++            [-math.pi, math.pi],
++        ]
++
++    def equivalent_wrapped_state(self, state):
++        wrapped_state = torch.clone(state)
++        wrapped_state[..., 2] = (wrapped_state[..., 2] + math.pi) % (2*math.pi) - math.pi
++        wrapped_state[..., 5] = (wrapped_state[..., 5] + math.pi) % (2*math.pi) - math.pi
++        return wrapped_state
++
++    # \dot x_p  = v \cos th_p
++    # \dot y_p  = v \sin th_p
++    # \dot th_p = d
++    # \dot x_e  = v \cos th_e
++    # \dot y_e  = v \sin th_e
++    # \dot th_e = u
++    def dsdt(self, state, control, disturbance):
++        dsdt = torch.zeros_like(state)
++        dsdt[..., 0] = self.velocity*torch.cos(state[..., 2])
++        dsdt[..., 1] = self.velocity*torch.sin(state[..., 2])
++        dsdt[..., 2] = disturbance[..., 0]
++        dsdt[..., 3] = self.velocity*torch.cos(state[..., 5])
++        dsdt[..., 4] = self.velocity*torch.sin(state[..., 5])
++        dsdt[..., 5] = control[..., 0]
++        return dsdt
++
++    def boundary_fn(self, state):
++        return torch.norm(state[..., 0:2] - state[..., 3:5], dim=-1) - self.collisionR
++
++    def sample_target_state(self, num_samples):
++        raise NotImplementedError
++
++    def cost_fn(self, state_traj):
++        return torch.min(self.boundary_fn(state_traj), dim=-1).values
++
++    def hamiltonian(self, state, dvds):
++        ham = self.velocity*torch.cos(state[..., 2])*dvds[..., 0] \
++            + self.velocity*torch.sin(state[..., 2])*dvds[..., 1] \
++            + self.velocity*torch.cos(state[..., 5])*dvds[..., 3] \
++            + self.velocity*torch.sin(state[..., 5])*dvds[..., 4]
++        ham = ham + self.omega_max * torch.abs(dvds[..., 5])  # evader control (maximizing)
++        ham = ham - self.omega_max * torch.abs(dvds[..., 2])  # pursuer disturbance (minimizing)
++        return ham
++
++    def optimal_control(self, state, dvds):
++        return (self.omega_max * torch.sign(dvds[..., 5]))[..., None]
++
++    def optimal_disturbance(self, state, dvds):
++        return (-self.omega_max * torch.sign(dvds[..., 2]))[..., None]
++
++    def plot_config(self):
++        return {
++            'state_slices': [0, 0, math.pi/2, 0, 0, 0],
++            'state_labels': ['x_p', 'y_p', 'th_p', 'x_e', 'y_e', 'th_e'],
++            'x_axis_idx': 0,
++            'y_axis_idx': 1,
++            'z_axis_idx': 2,
++        }
++
++
++class LinearOscillator2D(Dynamics):
++    """Controlled linear oscillator: reach a circle of radius goalR.
++
++    x1' = x2, x2' = -omega^2 x1 + u + d; control minimizes (reach),
++    disturbance maximizes.
++    """
++    def __init__(self, goalR:float, omega:float, u_max:float, d_max:float):
++        self.goalR = goalR
++        self.omega = omega
++        self.u_max = u_max
++        self.d_max = d_max
++        super().__init__(
++            loss_type='brt_hjivi', set_mode='reach',
++            state_dim=2, input_dim=3, control_dim=1, disturbance_dim=1,
++            state_mean=[0, 0],
++            state_var=[1, 1],
++            value_mean=0.25,
++            value_var=0.5,
++            value_normto=0.02,
++            deepreach_model="exact",
++        )
++
++    def state_test_range(self):
++        return [
++            [-1, 1],
++            [-1, 1],
++        ]
++
++    def equivalent_wrapped_state(self, state):
++        return torch.clone(state)
++
++    def dsdt(self, state, control, disturbance):
++        dsdt = torch.zeros_like(state)
++        dsdt[..., 0] = state[..., 1]
++        dsdt[..., 1] = -(self.omega**2)*state[..., 0] + control[..., 0] + disturbance[..., 0]
++        return dsdt
++
++    def boundary_fn(self, state):
++        return torch.norm(state[..., 0:2], dim=-1) - self.goalR
++
++    def sample_target_state(self, num_samples):
++        raise NotImplementedError
++
++    def cost_fn(self, state_traj):
++        return torch.min(self.boundary_fn(state_traj), dim=-1).values
++
++    def hamiltonian(self, state, dvds):
++        ham = state[..., 1]*dvds[..., 0] - (self.omega**2)*state[..., 0]*dvds[..., 1]
++        ham = ham - self.u_max * torch.abs(dvds[..., 1])  # control (minimizing, reach)
++        ham = ham + self.d_max * torch.abs(dvds[..., 1])  # disturbance (maximizing)
++        return ham
++
++    def optimal_control(self, state, dvds):
++        return (-self.u_max * torch.sign(dvds[..., 1]))[..., None]
++
++    def optimal_disturbance(self, state, dvds):
++        return (self.d_max * torch.sign(dvds[..., 1]))[..., None]
++
++    def plot_config(self):
++        return {
++            'state_slices': [0, 0],
++            'state_labels': ['x1', 'x2'],
++            'x_axis_idx': 0,
++            'y_axis_idx': 1,
++            'z_axis_idx': 1,
++        }
+diff --git a/run_experiment.py b/run_experiment.py
+index bdc3125..704aa44 100644
+--- a/run_experiment.py
++++ b/run_experiment.py
+@@ -60,7 +60,7 @@ if (mode == 'all') or (mode == 'train'):
+     p.add_argument('--model_mode', type=str, default='mlp', required=False, choices=['mlp', 'rbf', 'pinn'], help='Whether to use uniform velocity parameter')
+     p.add_argument('--num_hl', type=int, default=3, required=False, help='The number of hidden layers')
+     p.add_argument('--num_nl', type=int, default=512, required=False, help='Number of neurons per hidden layer.')
+-    p.add_argument('--deepreach_model', type=str, default='exact', required=False, choices=['exact', 'diff', 'vanilla'], help='deepreach model')
++    p.add_argument('--deepreach_model', type=str, default='exact', required=False, choices=['exact', 'diff', 'vanilla', 'exact_conservative'], help='deepreach model')
+ 
+     # training options
+     p.add_argument('--epochs_til_ckpt', type=int, default=1000, help='Time interval in seconds until checkpoint is saved.')
+@@ -72,6 +72,10 @@ if (mode == 'all') or (mode == 'train'):
+     p.add_argument('--use_lbfgs', default=False, type=bool, help='use L-BFGS.')
+     p.add_argument('--adj_rel_grads', default=True, type=bool, help='adjust the relative magnitude of the losses')
+     p.add_argument('--dirichlet_loss_divisor', default=1.0, required=False, type=float, help='What to divide the dirichlet loss by for loss reweighting')
++    p.add_argument('--conservative', default=False, action='store_true', help='use the conservative (subsolution) HJI-VI loss')
++    p.add_argument('--w_ineq', default=1.0, type=float, help='conservative loss: weight on subsolution-violation term')
++    p.add_argument('--w_act', default=1.2, type=float, help='conservative loss: weight on complementarity/tightness term')
++    p.add_argument('--conservative_shift', default=-8.0, type=float, help='softplus shift for the nonpositive correction')
+ 
+     # cost-supervised learning (CSL) options
+     p.add_argument('--use_CSL', default=False, action='store_true', help='use cost-supervised learning (CSL)')
+@@ -184,7 +188,12 @@ experiment.init_special(**{argname: getattr(orig_opt, argname) for argname in in
+ 
+ if (mode == 'all') or (mode == 'train'):
+     if dynamics.loss_type == 'brt_hjivi':
+-        loss_fn = losses.init_brt_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)
++        if getattr(orig_opt, 'conservative', False):
++            dynamics.conservative_shift = orig_opt.conservative_shift
++            loss_fn = losses.init_brt_hjivi_conservative_loss(
++                dynamics, orig_opt.w_ineq, orig_opt.w_act, orig_opt.dirichlet_loss_divisor)
++        else:
++            loss_fn = losses.init_brt_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)
+     elif dynamics.loss_type == 'brat_hjivi':
+         loss_fn = losses.init_brat_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)
+     else:
+diff --git a/utils/losses.py b/utils/losses.py
+index cb1c033..3d10a65 100644
+--- a/utils/losses.py
++++ b/utils/losses.py
+@@ -50,4 +50,45 @@ def init_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
+                 return {'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
+         return {'dirichlet': torch.abs(dirichlet).sum() / dirichlet_loss_divisor,
+                 'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
+-    return brat_hjivi_loss
+\ No newline at end of file
++    return brat_hjivi_loss
++
++def init_brt_hjivi_conservative_loss(dynamics, w_ineq, w_act, dirichlet_loss_divisor):
++    """Conservative (subsolution) HJI-VI loss.
++
++    Splits the VI into its two branches
++        r_pde = dV/dtau - H(x, dV/dx),      r_g = V - g(x)
++    and trains toward a SUBSOLUTION (both <= 0) rather than an exact solution:
++
++        L = w_ineq * E[ relu(r_pde)^2 + relu(r_g)^2 ]     (safety: penalize violations)
++          + w_act  * E[ min(r_pde^2, r_g^2) ]             (tightness: one branch active)
++
++    With deepreach_model='exact_conservative' the r_g branch holds by
++    construction, so the inequality term acts on r_pde. By the comparison
++    principle a subsolution's sub-level set contains the true BRT, i.e. the
++    learned tube over-approximates (errs toward declaring states unsafe).
++    """
++    def brt_hjivi_conservative_loss(state, value, dvdt, dvds, boundary_value, dirichlet_mask, output):
++        if torch.all(dirichlet_mask):
++            # pretraining: match the terminal condition only
++            diff_constraint_hom = torch.Tensor([0])
++            ineq = torch.Tensor([0])
++            act = torch.Tensor([0])
++        else:
++            ham = dynamics.hamiltonian(state, dvds)
++            r_pde = dvdt - ham
++            r_g = value - boundary_value
++            ineq = torch.relu(r_pde).pow(2) + torch.relu(r_g).pow(2)
++            act = torch.minimum(r_pde.pow(2), r_g.pow(2))
++            diff_constraint_hom = w_ineq * ineq + w_act * act
++
++        dirichlet = value[dirichlet_mask] - boundary_value[dirichlet_mask]
++        if dynamics.deepreach_model in ('exact', 'exact_conservative'):
++            if torch.all(dirichlet_mask):
++                dirichlet = output.squeeze(dim=-1)[dirichlet_mask] - 0.0
++            else:
++                return {'diff_constraint_hom': diff_constraint_hom.sum()}
++
++        return {'dirichlet': torch.abs(dirichlet).sum() / dirichlet_loss_divisor,
++                'diff_constraint_hom': diff_constraint_hom.sum()}
++
++    return brt_hjivi_conservative_loss

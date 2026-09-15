@@ -1,0 +1,1 @@
+Base: upstream smlbansal/deepreach branch robust_DeepReach_MPC @ 78ba272 ('Update: readme'). Patch = git diff 78ba272 (local commits 2aecc9b..cb301b9) excluding runs/, data/, wandb.py, seaborn.py stubs. Regenerated 2026-09-01.

@@ -1,0 +1,961 @@
+diff --git a/.gitignore b/.gitignore
+index 3af0ccb..9166990 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,4 @@
+-/data
++runs/
++__pycache__/
++*.pyc
++wandb/
+diff --git a/dynamics/__init__.py b/dynamics/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/dynamics/dynamics.py b/dynamics/dynamics.py
+index 634941a..3a0b765 100644
+--- a/dynamics/dynamics.py
++++ b/dynamics/dynamics.py
+@@ -1,3 +1,4 @@
++import os
+ from abc import ABC, abstractmethod
+ from utils import diff_operators, quaternion
+ 
+@@ -51,6 +52,16 @@ class Dynamics(ABC):
+         self.value_var = value_var
+         self.value_normto = value_normto
+         self.deepReach_model = deepReach_model
++        # exact_cons is V = g - softplus(out + cons_shift) * t * (value_var/value_normto).
++        # That trailing scale is 25x for Air3D/Air6D/MultiVehicle9D but 106x for the
++        # Quadrotor, so a FIXED shift of -8 makes the same network output move V four
++        # times as far there -- which is why every quadrotor `ours` run diverged to NaN
++        # within 500 iterations while clipping alone did not save it. Normalise the
++        # INITIAL correction magnitude across systems: softplus(shift)*scale held at
++        # the value it has for the 25x systems, so those are bit-identical (log(1)=0)
++        # and only differently-scaled systems shift.
++        _scale = float(value_var) / float(value_normto)
++        self.cons_shift = -8.0 - math.log(max(_scale, 1e-9) / 25.0)
+ 
+         assert self.loss_type in [
+             "brt_hjivi",
+@@ -104,6 +115,12 @@ class Dynamics(ABC):
+             return (
+                 output * input[..., 0] * self.value_var / self.value_normto
+             ) + self.boundary_fn(self.input_to_coord(input)[..., 1:])
++        elif self.deepReach_model == "exact_cons":
++            # conservative-by-construction: V = g - s*t*softplus(NN+shift) <= g
++            import torch.nn.functional as _F
++            f = _F.softplus(output + getattr(self, "cons_shift", -8.0))
++            return -(f * input[..., 0] * self.value_var / self.value_normto) + self.boundary_fn(
++                self.input_to_coord(input)[..., 1:])
+         elif self.deepReach_model == "exact_diff":
+             # Another way to impose exact BC: V(x,t)= l(x) + NN(x,t) - NN(x,0)
+             output0 = output[0].squeeze(dim=-1)
+@@ -176,6 +193,19 @@ class Dynamics(ABC):
+                 self.boundary_fn(state).unsqueeze(dim=-1), state
+             )[0].squeeze(dim=-2)
+             dvds = dvds_term1 + dvds_term2
++        elif self.deepReach_model == "exact_cons":
++            import torch as _t
++            fp = _t.sigmoid(output + getattr(self, "cons_shift", -8.0))
++            f = _t.nn.functional.softplus(output + getattr(self, "cons_shift", -8.0))
++            s_ = self.value_var / self.value_normto
++            dvdt = -s_ * (input[..., 0] * dodi[..., 0] * fp + f)
++            dvds_term1 = -(s_ / self.state_var.to(device=dodi.device)) * dodi[..., 1:] \
++                * fp.unsqueeze(-1) * input[..., 0].unsqueeze(-1)
++            state = self.input_to_coord(input)[..., 1:]
++            dvds_term2 = diff_operators.jacobian(
++                self.boundary_fn(state).unsqueeze(dim=-1), state
++            )[0].squeeze(dim=-2)
++            dvds = dvds_term1 + dvds_term2
+         else:
+             dvdt = (self.value_var / self.value_normto) * dodi[..., 0]
+             dvds = (
+@@ -1035,7 +1065,11 @@ class F1tenth(Dynamics):
+         self.control_init = torch.tensor([0.0, 0.0]).to(device)
+ 
+         # for the track
+-        self.obstaclemap_file = "dynamics/F1_map_obstaclemap.mat"
++        # Resolve relative to this module, not the cwd: the training entrypoint
++        # runs from external/madr but every evaluation script runs from the
++        # repo root, where the cwd-relative path broke model loading.
++        self.obstaclemap_file = os.path.join(
++            os.path.dirname(os.path.abspath(__file__)), "F1_map_obstaclemap.mat")
+         self.pixel2world = 0.0625
+         self.obstacle_map = spio.loadmat(self.obstaclemap_file)
+         self.obstacle_map = self.obstacle_map["obs_map"]
+@@ -1710,6 +1744,17 @@ class LessLinearND(Dynamics):
+             [[-u_max, u_max] for _ in range(self.N - 1)]
+         ).to(device)
+         self.eps_var = torch.tensor([u_max for _ in range(self.N - 1)]).to(device)
++        # Upstream inconsistency: this class declares disturbance_dim = N-1 but has
++        # no disturbance plumbing at all, while optimal_disturbance() returns 0.0 and
++        # dsdt() ignores its disturbance argument -- i.e. the disturbance is inert.
++        # The MPC rollout nonetheless reads disturbance_init / disturbance_range /
++        # the disturbance eps, so every MPC model died before training. Supply them at
++        # the declared width with ZERO bounds and zero variance, which keeps the
++        # disturbance inert exactly as the dynamics intend.
++        self.disturbance_init = torch.zeros(self.N - 1).to(device)
++        self.disturbance_range_ = torch.tensor(
++            [[0.0, 0.0] for _ in range(self.N - 1)]).to(device)
++        self.eps_var_disturbance = torch.zeros(self.N - 1).to(device)
+         self.control_init = torch.tensor([0.0 for _ in range(self.N - 1)]).to(device)
+ 
+         super().__init__(
+@@ -1742,6 +1787,15 @@ class LessLinearND(Dynamics):
+     def control_range(self, state):
+         return self.control_range_.cpu().tolist()
+ 
++    def disturbance_range(self, state):
++        return self.disturbance_range_.cpu().tolist()
++
++    def bound_disturbance(self, disturbance):
++        return torch.zeros_like(torch.as_tensor(disturbance))
++
++    def clamp_disturbance(self, state, disturbance):
++        return torch.zeros_like(torch.as_tensor(disturbance))
++
+     def equivalent_wrapped_state(self, state):
+         wrapped_state = torch.clone(state)
+         return wrapped_state
+@@ -1825,7 +1879,9 @@ class LessLinearND(Dynamics):
+             return self.u_max * torch.sign(dvds[..., 1:])
+ 
+     def optimal_disturbance(self, state, dvds):
+-        return 0.0
++        # Was the scalar 0.0, which broke every caller that treats the result as a
++        # tensor. Inert disturbance at the declared width instead.
++        return torch.zeros(*state.shape[:-1], self.N - 1).to(state.device)
+ 
+     def plot_config(self):  # FIXME
+         return {
+@@ -1880,11 +1936,19 @@ class VertDrone2DWithDist(VertDrone2D):
+ 
+ class Air3D(Dynamics):
+     def __init__(self, set_mode: str):
++        # Aligned 2026-08-28 to the CANONICAL DeepReach Air3D instance, so that
++        # runs here are comparable with scripts/configs/models/air3d_*.yaml.
++        # As shipped this class used v=0.6, omega_max=2.0, state_max=1.5 and no
++        # angle_alpha factor -- a different system, which makes any cross-codebase
++        # comparison meaningless. Reference: external/deepreach Air3D
++        # (collisionR, velocity, omega_max, angle_alpha_factor) with
++        # state_var=[1, 1, angle_alpha*pi], value_mean=0.25, value_var=0.5.
+         self.goalR = 0.25
+-        self.evader_velocity = 0.6
+-        self.pursuer_velocity = 0.6
+-        self.omega_max = 2.0
+-        self.state_max = 1.5
++        self.evader_velocity = 0.75
++        self.pursuer_velocity = 0.75
++        self.omega_max = 3.0
++        self.state_max = 1.0
++        self.angle_alpha_factor = 1.2
+ 
+         self.state_range_ = torch.tensor(
+             [
+@@ -1906,19 +1970,22 @@ class Air3D(Dynamics):
+ 
+         state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
+         state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
++        # DeepReach normalises the heading by angle_alpha_factor*pi (not by the
++        # raw half-range pi), so the network sees |theta_net| <= 1/1.2 < 1.
++        state_var_[2] = self.angle_alpha_factor * math.pi
+ 
+         super().__init__(
+             name="Air3D",
+             loss_type="brt_hjivi",
+             set_mode=set_mode,
+             state_dim=3,
+-            input_dim=5,
++            input_dim=4,
+             control_dim=1,
+             disturbance_dim=1,
+             state_mean=state_mean_.cpu().tolist(),
+             state_var=state_var_.cpu().tolist(),
+-            value_mean=0.5,
+-            value_var=1,
++            value_mean=0.25,
++            value_var=0.5,
+             value_normto=0.02,
+             deepReach_model="exact",
+         )
+@@ -1964,13 +2031,13 @@ class Air3D(Dynamics):
+         return wrapped_state
+ 
+     def periodic_transform_fn(self, input):
+-        output_shape = list(input.shape)
+-        output_shape[-1] = output_shape[-1] + 1
+-        transformed_input = torch.zeros(output_shape)
+-        transformed_input[..., :3] = input[..., :3]
+-        transformed_input[..., 3] = torch.sin(input[..., 3] * self.state_var[-1])
+-        transformed_input[..., 4] = torch.cos(input[..., 3] * self.state_var[-1])
+-        return transformed_input.to(device)
++        # Identity. As shipped this lifted the heading to (sin, cos), giving
++        # input_dim=5. Official DeepReach Air3D -- and our models -- feed the raw
++        # heading normalised by angle_alpha_factor*pi as a single input
++        # (input_dim=4). Matching that keeps the heading encoding, and hence the
++        # network input, identical across the codebases being compared.
++        return input.to(device)
++
+ 
+     def dsdt(self, state, control, disturbance):
+         dsdt = torch.zeros_like(state)
+@@ -2039,6 +2106,277 @@ class Air3D(Dynamics):
+         }
+ 
+ 
++class Air6D(Dynamics):
++    """6D joint two-vehicle Air3D, matching src/lvfm/residuals.py::Air6DJointResidual.
++
++    State s = [x_p, y_p, theta_p, x_e, y_e, theta_e] -- pursuer first, as in our
++    residual. Each vehicle is a Dubins car; the EVADER's turn rate is the control
++    (maximising) and the PURSUER's is the disturbance (minimising), so this is the
++    joint-state form of the Air3D avoid game.
++
++    Deliberately NOT Dubins6D: that class adds a box-containment term to its
++    boundary (min(collision, box)), which our target function does not have, and
++    uses v=0.6, omega=1.9 on a +/-3.5 x +/-2.5 domain. Here the canonical
++    DeepReach Air3D constants are used so the 6D study is the same system as the
++    3D one, lifted.
++    """
++
++    def __init__(self, set_mode: str = "avoid"):
++        self.goalR = 0.25
++        self.evader_velocity = 0.75
++        self.pursuer_velocity = 0.75
++        self.omega_max = 3.0
++        self.state_max = 1.0
++        self.angle_alpha_factor = 1.2
++
++        self.state_range_ = torch.tensor([
++            [-self.state_max, self.state_max],
++            [-self.state_max, self.state_max],
++            [-math.pi, math.pi],
++            [-self.state_max, self.state_max],
++            [-self.state_max, self.state_max],
++            [-math.pi, math.pi],
++        ]).to(device)
++        self.control_range_ = torch.tensor([[-self.omega_max, self.omega_max]]).to(device)
++        self.disturbance_range_ = torch.tensor([[-self.omega_max, self.omega_max]]).to(device)
++        self.control_init = torch.zeros(1).to(device)
++        self.disturbance_init = torch.zeros(1).to(device)
++        self.set_mode = set_mode
++        self.eps_var = torch.tensor([1]).to(device)
++
++        state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
++        state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
++        state_var_[2] = self.angle_alpha_factor * math.pi
++        state_var_[5] = self.angle_alpha_factor * math.pi
++
++        super().__init__(
++            name="Air6D", loss_type="brt_hjivi", set_mode=set_mode,
++            state_dim=6, input_dim=7, control_dim=1, disturbance_dim=1,
++            state_mean=state_mean_.cpu().tolist(),
++            state_var=state_var_.cpu().tolist(),
++            value_mean=0.25, value_var=0.5, value_normto=0.02,
++            deepReach_model="exact",
++        )
++
++    def control_range(self, state):
++        return self.control_range_.cpu().tolist()
++
++    def disturbance_range(self, state):
++        return self.disturbance_range_.cpu().tolist()
++
++    def clamp_disturbance(self, state, disturbance):
++        return self.bound_disturbance(disturbance)
++
++    def bound_disturbance(self, disturbance):
++        return torch.clamp(disturbance, self.disturbance_range_[..., 0],
++                           self.disturbance_range_[..., 1])
++
++    def clamp_control(self, state, control):
++        return torch.clamp(control, self.control_range_[..., 0], self.control_range_[..., 1])
++
++    def state_test_range(self):
++        return self.state_range_.cpu().tolist()
++
++    def state_verification_range(self):
++        # scenario_optimization() samples through this; without it the recovery /
++        # post-hoc-certification evaluation dies with AttributeError, which is why
++        # every high-dim recovery run produced no basic_logs. Same convention the
++        # shipped classes use: verify over the training range.
++        return self.state_range_.cpu().tolist()
++
++    def equivalent_wrapped_state(self, state):
++        w = torch.clone(state)
++        w[..., 2] = (w[..., 2] + math.pi) % (2 * math.pi) - math.pi
++        w[..., 5] = (w[..., 5] + math.pi) % (2 * math.pi) - math.pi
++        return w
++
++    def periodic_transform_fn(self, input):
++        # Identity: raw headings normalised by alpha*pi, matching our models and
++        # official DeepReach (no sin/cos lift), so input_dim = 1 + 6.
++        return input.to(device)
++
++    def dsdt(self, state, control, disturbance):
++        out = torch.zeros_like(state)
++        th_p, th_e = state[..., 2], state[..., 5]
++        out[..., 0] = self.pursuer_velocity * torch.cos(th_p)
++        out[..., 1] = self.pursuer_velocity * torch.sin(th_p)
++        out[..., 2] = disturbance[..., 0]          # pursuer turn rate = disturbance
++        out[..., 3] = self.evader_velocity * torch.cos(th_e)
++        out[..., 4] = self.evader_velocity * torch.sin(th_e)
++        out[..., 5] = control[..., 0]              # evader turn rate = control
++        return out
++
++    def boundary_fn(self, state):
++        # Collision distance only -- no box term.
++        dx = state[..., 0] - state[..., 3]
++        dy = state[..., 1] - state[..., 4]
++        return torch.sqrt(dx ** 2 + dy ** 2 + 1e-12) - self.goalR
++
++    def cost_fn(self, state_traj):
++        return torch.min(self.boundary_fn(state_traj), dim=-1).values
++
++    def sample_target_state(self, num_samples):
++        raise NotImplementedError
++
++    def hamiltonian(self, state, dvds):
++        th_p, th_e = state[..., 2], state[..., 5]
++        base = (self.pursuer_velocity * torch.cos(th_p) * dvds[..., 0]
++                + self.pursuer_velocity * torch.sin(th_p) * dvds[..., 1]
++                + self.evader_velocity * torch.cos(th_e) * dvds[..., 3]
++                + self.evader_velocity * torch.sin(th_e) * dvds[..., 4])
++        if self.set_mode == "avoid":
++            return (base + self.omega_max * torch.abs(dvds[..., 5])
++                    - self.omega_max * torch.abs(dvds[..., 2]))
++        elif self.set_mode == "reach":
++            return (base - self.omega_max * torch.abs(dvds[..., 5])
++                    + self.omega_max * torch.abs(dvds[..., 2]))
++        raise NotImplementedError
++
++    def optimal_control(self, state, dvds):
++        sgn = 1.0 if self.set_mode == "avoid" else -1.0
++        return (sgn * self.omega_max * torch.sign(dvds[..., 5]))[..., None]
++
++    def optimal_disturbance(self, state, dvds):
++        sgn = -1.0 if self.set_mode == "avoid" else 1.0
++        return (sgn * self.omega_max * torch.sign(dvds[..., 2]))[..., None]
++
++    def plot_config(self):
++        return {"state_slices": [0.0, 0.0, 0.0, 0.5, 0.0, math.pi],
++                "state_labels": ["x_p", "y_p", "th_p", "x_e", "y_e", "th_e"],
++                "x_axis_idx": 3, "y_axis_idx": 4, "z_axis_idx": 5}
++
++
++class MultiVehicle9D(Dynamics):
++    """9D three-vehicle collision avoidance -- DeepReach's published high-dim benchmark.
++
++    Ported VERBATIM from external/deepreach/dynamics/dynamics.py::MultiVehicleCollision
++    so the 9D study is the same system the DeepReach paper reports, not a variant.
++    Constants: v = 0.6, omega_max = 1.1, R = 0.25, domain +/-1, alpha = 1.2.
++
++    State s = [x1, y1, x2, y2, x3, y3, th1, th2, th3]. Three Dubins cars, EACH
++    controlling its own turn rate (control_dim 3, no disturbance), avoiding pairwise
++    collision. boundary_fn = min over all three pairwise distances - R.
++
++    Identity periodic_transform_fn (raw headings / (alpha*pi), no sin-cos lift) so
++    input_dim = 10, matching both official DeepReach and our Air3D/Air6D models.
++    """
++
++    def __init__(self, set_mode: str = "avoid"):
++        self.angle_alpha_factor = 1.2
++        self.velocity = 0.6
++        self.omega_max = 1.1
++        self.collisionR = 0.25
++        self.state_range_ = torch.tensor(
++            [[-1.0, 1.0]] * 6 + [[-math.pi, math.pi]] * 3
++        ).to(device)
++        self.control_range_ = torch.tensor(
++            [[-self.omega_max, self.omega_max]] * 3
++        ).to(device)
++        self.control_init = torch.zeros(3).to(device)
++        self.disturbance_init = torch.zeros(0).to(device)
++        self.eps_var = torch.tensor([1]).to(device)
++        super().__init__(
++            name="MultiVehicle9D", loss_type="brt_hjivi", set_mode=set_mode,
++            state_dim=9, input_dim=10, control_dim=3, disturbance_dim=0,
++            state_mean=[0, 0, 0, 0, 0, 0, 0, 0, 0],
++            state_var=[1, 1, 1, 1, 1, 1,
++                       self.angle_alpha_factor * math.pi,
++                       self.angle_alpha_factor * math.pi,
++                       self.angle_alpha_factor * math.pi],
++            value_mean=0.25, value_var=0.5, value_normto=0.02,
++            deepReach_model="exact",
++        )
++
++    def control_range(self, state):
++        return self.control_range_.cpu().tolist()
++
++    def disturbance_range(self, state):
++        return []
++
++    def clamp_control(self, state, control):
++        return torch.clamp(control, -self.omega_max, self.omega_max)
++
++    def clamp_disturbance(self, state, disturbance):
++        return disturbance
++
++    def bound_disturbance(self, disturbance):
++        return disturbance
++
++    def state_test_range(self):
++        return self.state_range_.cpu().tolist()
++
++    def state_verification_range(self):
++        # scenario_optimization() samples through this; without it the recovery /
++        # post-hoc-certification evaluation dies with AttributeError, which is why
++        # every high-dim recovery run produced no basic_logs. Same convention the
++        # shipped classes use: verify over the training range.
++        return self.state_range_.cpu().tolist()
++
++    def equivalent_wrapped_state(self, state):
++        w = torch.clone(state)
++        for i in (6, 7, 8):
++            w[..., i] = (w[..., i] + math.pi) % (2 * math.pi) - math.pi
++        return w
++
++    def periodic_transform_fn(self, input):
++        return input.to(device)
++
++    def dsdt(self, state, control, disturbance):
++        out = torch.zeros_like(state)
++        out[..., 0] = self.velocity * torch.cos(state[..., 6])
++        out[..., 1] = self.velocity * torch.sin(state[..., 6])
++        out[..., 2] = self.velocity * torch.cos(state[..., 7])
++        out[..., 3] = self.velocity * torch.sin(state[..., 7])
++        out[..., 4] = self.velocity * torch.cos(state[..., 8])
++        out[..., 5] = self.velocity * torch.sin(state[..., 8])
++        out[..., 6] = control[..., 0]
++        out[..., 7] = control[..., 1]
++        out[..., 8] = control[..., 2]
++        return out
++
++    def boundary_fn(self, state):
++        # min over the three pairwise distances (1-2, 1-3, 2-3) minus R.
++        d12 = torch.norm(state[..., 0:2] - state[..., 2:4], dim=-1)
++        d13 = torch.norm(state[..., 0:2] - state[..., 4:6], dim=-1)
++        d23 = torch.norm(state[..., 2:4] - state[..., 4:6], dim=-1)
++        return torch.min(torch.min(d12, d13), d23) - self.collisionR
++
++    def cost_fn(self, state_traj):
++        return torch.min(self.boundary_fn(state_traj), dim=-1).values
++
++    def sample_target_state(self, num_samples):
++        raise NotImplementedError
++
++    def hamiltonian(self, state, dvds):
++        ham = (self.velocity * (torch.cos(state[..., 6]) * dvds[..., 0]
++                                + torch.sin(state[..., 6]) * dvds[..., 1])
++               + self.omega_max * torch.abs(dvds[..., 6]))
++        ham = ham + (self.velocity * (torch.cos(state[..., 7]) * dvds[..., 2]
++                                      + torch.sin(state[..., 7]) * dvds[..., 3])
++                     + self.omega_max * torch.abs(dvds[..., 7]))
++        ham = ham + (self.velocity * (torch.cos(state[..., 8]) * dvds[..., 4]
++                                      + torch.sin(state[..., 8]) * dvds[..., 5])
++                     + self.omega_max * torch.abs(dvds[..., 8]))
++        if self.set_mode == "avoid":
++            return ham
++        raise NotImplementedError("MultiVehicle9D is an avoid benchmark")
++
++    def optimal_control(self, state, dvds):
++        return self.omega_max * torch.sign(dvds[..., [6, 7, 8]])
++
++    def optimal_disturbance(self, state, dvds):
++        return torch.zeros(1).to(device)
++
++    def plot_config(self):
++        return {
++            "state_slices": [0.0, 0.0, -0.4, 0.0, 0.4, 0.0,
++                             math.pi / 2, -math.pi / 2, math.pi / 2],
++            "state_labels": ["x1", "y1", "x2", "y2", "x3", "y3",
++                             "th1", "th2", "th3"],
++            "x_axis_idx": 0, "y_axis_idx": 1, "z_axis_idx": 6,
++        }
++
++
+ class Dubins6D(Dynamics):
+     def __init__(self, collisionR: float, set_mode: str, velocity: float = 0.6):
+         self.evader_velocity = velocity
+@@ -2276,6 +2614,11 @@ class QuadrotorWithDist(Quadrotor):
+     ):
+         super().__init__(collisionR, collective_thrust_max, set_mode)
+         self.disturbance_max = disturbance_max
++        # Quadrotor sets eps_var with 4 entries (control_dim); the MPC gaussian
++        # disturbance sampler falls back to it when eps_var_disturbance is absent,
++        # so a 6D disturbance broadcast (6) against (4) and every MPC model crashed.
++        self.eps_var_disturbance = torch.full(
++            (6,), float(disturbance_max) ** 2).to(device)
+         self.wind_force_max = disturbance_max
+         self.wind_torque_max = disturbance_max
+         self.disturbance_dim = 6  # 3 forces + 3 torques
+diff --git a/experiments/__init__.py b/experiments/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/experiments/experiments.py b/experiments/experiments.py
+index ac1c9ff..3f624da 100644
+--- a/experiments/experiments.py
++++ b/experiments/experiments.py
+@@ -81,6 +81,36 @@ class Experiment(ABC):
+ 
+         scheduler = torch.optim.lr_scheduler.ExponentialLR(
+             self.optim, gamma=0.9997)  # by default running without scheduler, 0.9997
++
++        # Optional warmup + cosine decay, byte-for-byte the same rule as
++        # scripts/train_unsupervised.py::make_lr_schedule, so that runs here use
++        # exactly the learning-rate setup our models were trained with.
++        _lr_kind = str(getattr(self, "lr_schedule", "none")).lower()
++        _lr_warmup = int(getattr(self, "lr_warmup_steps", 0))
++        _lr_minf = float(getattr(self, "lr_min_factor", 0.01))
++        _lr_total = max(int(epochs), 1)
++
++        def _apply_lr(step):
++            if _lr_kind in ("none", "", "constant"):
++                return None
++            if _lr_warmup > 0 and step < _lr_warmup:
++                factor = (step + 1) / float(_lr_warmup)
++            elif _lr_kind == "cosine":
++                prog = min(max((step - _lr_warmup) / max(_lr_total - _lr_warmup, 1), 0.0), 1.0)
++                factor = _lr_minf + (1.0 - _lr_minf) * 0.5 * (1.0 + math.cos(math.pi * prog))
++            elif _lr_kind == "linear":
++                prog = min(max((step - _lr_warmup) / max(_lr_total - _lr_warmup, 1), 0.0), 1.0)
++                factor = _lr_minf + (1.0 - _lr_minf) * (1.0 - prog)
++            else:
++                raise ValueError(f"Unknown lr_schedule: {_lr_kind}")
++            new_lr = lr * factor
++            for g in self.optim.param_groups:
++                g["lr"] = new_lr
++            return new_lr
++
++        if _lr_kind not in ("none", "", "constant"):
++            print(f"[lr] schedule={_lr_kind} base={lr} warmup={_lr_warmup} "
++                  f"min_factor={_lr_minf} over {_lr_total} epochs", flush=True)
+         # copy settings from Raissi et al. (2019) and here
+         # https://github.com/maziarraissi/PINNs
+         if use_lbfgs:
+@@ -165,6 +195,9 @@ class Experiment(ABC):
+                         avoid_values = gt['avoid_values']
+                     dirichlet_masks = gt['dirichlet_masks']
+ 
++                    # gPINN needs d(residual)/d(model_in); stash the graph input so
++                    # the loss closure can differentiate through it.
++                    self.dataset.dynamics._gpinn_input = model_results['model_in']
+                     if self.dataset.dynamics.loss_type == 'brt_hjivi':
+                         losses = loss_fn(
+                             states, values, dvs[..., 0], dvs[..., 1:], boundary_values, dirichlet_masks, model_results['model_out'],
+@@ -206,7 +239,10 @@ class Experiment(ABC):
+                                     self.model.parameters(), max_norm=clip_grad)
+ 
+                         self.optim.step()
+-                        if epoch > (self.dataset.counter_end + self.dataset.pretrain_iters):
++                        # Our cosine schedule supersedes their ExponentialLR when set.
++                        if _lr_kind not in ("none", "", "constant"):
++                            _apply_lr(epoch)
++                        elif epoch > (self.dataset.counter_end + self.dataset.pretrain_iters):
+                             scheduler.step()
+ 
+                     pbar.update(1)
+@@ -240,8 +276,13 @@ class Experiment(ABC):
+                         epoch=epoch+1, save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot_epoch_%04d.png' % (epoch+1)),
+                         x_resolution=val_x_resolution, y_resolution=val_y_resolution, z_resolution=val_z_resolution, time_resolution=val_time_resolution)
+ 
+-        torch.save(checkpoint, os.path.join(
+-            checkpoints_dir, 'model_final.pth')) # save final model
++        # `checkpoint` was only ever bound inside the periodic-save branch above, so
++        # any run with num_epochs < epochs_til_checkpoint died here with
++        # UnboundLocalError instead of saving. Build it fresh from current state.
++        torch.save({'epoch': epochs,
++                    'model': self.model.state_dict(),
++                    'optimizer': self.optim.state_dict()},
++                   os.path.join(checkpoints_dir, 'model_final.pth'))
+ 
+         if was_eval:
+             self.model.eval()
+@@ -1129,7 +1170,7 @@ class Experiment(ABC):
+                 
+                 self.loss_weights['mpc_loss'] = 0.9*self.loss_weights['mpc_loss'] + 0.1*self.mpc_importance_coef*num/(den+1e-16)
+                 
+-        elif self.dataset.dynamics.deepReach_model == 'exact' and (self.dataset.counter>=1) and losses['mpc_loss'] > 1e-8:
++        elif self.dataset.dynamics.deepReach_model in ('exact', 'exact_cons') and (self.dataset.counter>=1) and losses['mpc_loss'] > 1e-8:
+ 
+             self.loss_weights['diff_constraint_hom']=1.0
+             params = OrderedDict(self.model.named_parameters())
+diff --git a/run_experiment.py b/run_experiment.py
+index 11e3813..3dbf123 100644
+--- a/run_experiment.py
++++ b/run_experiment.py
+@@ -171,9 +171,63 @@ if (mode == "all") or (mode == "train"):
+         type=str,
+         default="exact",
+         required=False,
+-        choices=["exact", "vanilla", "diff"],
++        choices=["exact", "vanilla", "diff", "exact_cons"],
+         help="deepreach model",
+     )
++    p.add_argument("--baseline_l2", action="store_true", default=False,
++                   help="ABLATION ONLY: square the VI residual so the baseline shares "
++                        "our loss's norm. Not the published DeepReach/MADR loss.")
++    p.add_argument("--baseline_l1", action="store_true", default=False,
++                   help="Use the verbatim published L1 VI-residual baseline loss "
++                        "(instead of the norm-matched two-sided L2). For the "
++                        "'vs published method' comparison only.")
++    p.add_argument("--lr_schedule", type=str, default="none",
++                   choices=["none", "cosine", "linear"])
++    p.add_argument("--lr_warmup_steps", type=int, default=0)
++    p.add_argument("--lr_min_factor", type=float, default=0.01)
++    p.add_argument("--our_loss_brat_direction", type=str, default="under",
++                   choices=["under", "over"],
++                   help="reach-avoid conservatism direction; 'under' (default) "
++                        "under-approximates the reach-avoid set, the safe side")
++    p.add_argument("--our_loss_under_weight", type=float, default=0.0,
++                   help="penalise relu(-r_pde)^2, the under-approximation direction "
++                        "the one-sided loss leaves free; small relative to w_ineq")
++    p.add_argument("--our_loss_norm", type=str, default="l2", choices=["l2", "l1"],
++                   help="norm of the our_loss terms. 'l2' (default) squares them, but a "
++                        "quadratic penalty's gradient vanishes as a violation closes, "
++                        "which is why frac(V<=V*) plateaus short of 1. 'l1' keeps "
++                        "constant pressure on any violation and matches the norm the "
++                        "published DeepReach/MADR baselines train with.")
++    p.add_argument("--our_loss_margin_consistent", action="store_true", default=False,
++                   help="shift the active/under terms to the same r = -margin target "
++                        "the inequality trains toward; without it they pull r -> 0 "
++                        "inside the slack band and partially cancel the margin")
++    p.add_argument("--our_loss_margin", type=float, default=0.0,
++                   help="strict-subsolution slack: penalise relu(sgn*r_pde + margin) so "
++                        "training targets r <= -margin (residual units, after "
++                        "residual_norm). Approximation error between collocation points "
++                        "must eat through the margin before containment breaks, and the "
++                        "conformal certificate can inflate by margin*tau (Gronwall).")
++    p.add_argument("--residual_norm", type=float, default=1.0,
++                   help="divide the PDE residual by this before the quadratic loss; "
++                        "use value_var/value_normto/25 on high-value-scale systems")
++    p.add_argument("--cons_shift", type=float, default=None,
++                   help="exact_cons softplus shift; default is scale-aware per system")
++    p.add_argument("--gpinn_weight", type=float, default=0.0,
++                   help="gradient-enhanced PDE loss weight; applies to ALL models")
++    p.add_argument("--our_loss_grad_weight", type=float, default=0.0,
++                   help="gPINN weight on |d r_pde/dx|^2 (archived consdr_gpinn used 0.01)")
++    p.add_argument("--our_loss_lambda_band", type=float, default=0.0,
++                   help="boundary-weighting gain (archived used 5.0 via use_boundary_weighting)")
++    p.add_argument("--our_loss_sigma_band", type=float, default=0.05)
++    p.add_argument("--our_loss_max_band_weight", type=float, default=20.0)
++    p.add_argument("--our_loss_active_weight", type=float, default=1.2,
++                   help="complementarity active-term weight (tightness); matches "
++                        "loss.hjvi_active_weight in scripts/configs/make_arm_configs.py")
++    p.add_argument("--our_loss_ineq_weight", type=float, default=1.0,
++                   help="complementarity inequality-term weight (subsolution direction)")
++    p.add_argument("--our_loss", action="store_true", default=False,
++                   help="use our one-sided conservative PDE loss")
+     p.add_argument(
+         "--pretrained_model",
+         type=str,
+@@ -680,8 +734,15 @@ with open(os.path.join(experiment_dir, "orig_opt.pickle"), "rb") as opt_file:
+     orig_opt = pickle.load(opt_file)
+ 
+ # set the experiment seed
+-# torch.manual_seed(orig_opt.seed)
+-torch.manual_seed(12)
++# Seed was hard-coded to 12 with the configurable line commented out, so every
++# run was identical and no seed variance could be measured. Restored.
++_seed = int(getattr(orig_opt, "seed", 12))
++torch.manual_seed(_seed)
++np.random.seed(_seed)
++random.seed(_seed)
++if torch.cuda.is_available():
++    torch.cuda.manual_seed_all(_seed)
++print(f"[seed] {_seed}", flush=True)
+ random.seed(orig_opt.seed)
+ np.random.seed(orig_opt.seed)
+ 
+@@ -699,6 +760,61 @@ if (mode == "train") and (opt.resume_checkpoint > 0):
+     orig_opt.num_epochs -= opt.resume_checkpoint
+ 
+ dynamics.set_model(orig_opt.deepReach_model)
++dynamics.our_loss = getattr(orig_opt, "our_loss", False)
++dynamics.our_loss_active_weight = getattr(orig_opt, "our_loss_active_weight", 1.2)
++dynamics.our_loss_ineq_weight = getattr(orig_opt, "our_loss_ineq_weight", 1.0)
++dynamics.our_loss_brat_direction = getattr(orig_opt, "our_loss_brat_direction", "under")
++if getattr(orig_opt, "cons_shift", None) is not None:
++    dynamics.cons_shift = float(orig_opt.cons_shift)
++# Run provenance. Run dirs previously recorded only the argparse config, so with
++# the vendored baseline moving across commits plus a dirty working tree there was
++# no way to attribute a checkpoint to a code version after the fact.
++try:
++    import subprocess as _sp
++    _d = os.path.dirname(os.path.abspath(__file__))
++    _sha = _sp.run(["git", "-C", _d, "rev-parse", "HEAD"], capture_output=True,
++                   text=True).stdout.strip()
++    _dirty = _sp.run(["git", "-C", _d, "diff"], capture_output=True,  # FULL diff: --stat lost the content (audit 09-02 S2-5)
++                     text=True).stdout.strip()
++    _pd = os.path.join(orig_opt.experiments_dir, orig_opt.experiment_name)
++    os.makedirs(_pd, exist_ok=True)
++    with open(os.path.join(_pd, "provenance.txt"), "w") as _f:
++        _f.write(f"madr_commit: {_sha}\ndirty:\n{_dirty or '(clean)'}\n")
++except Exception as _e:
++    print(f"[provenance] could not record: {_e}")
++
++dynamics.our_loss_under_weight = float(getattr(orig_opt, "our_loss_under_weight", 0.0))
++dynamics.our_loss_norm = getattr(orig_opt, "our_loss_norm", "l2")
++dynamics.our_loss_margin = float(getattr(orig_opt, "our_loss_margin", 0.0))
++dynamics.our_loss_margin_consistent = bool(getattr(orig_opt, "our_loss_margin_consistent", False))
++dynamics.residual_norm = float(getattr(orig_opt, "residual_norm", 1.0))
++dynamics.gpinn_weight = getattr(orig_opt, "gpinn_weight", 0.0) or getattr(
++    orig_opt, "our_loss_grad_weight", 0.0)  # old alias
++
++# FAIL LOUDLY rather than silently degrade. our_loss and gpinn are now implemented
++# in BOTH loss paths, but the exact_cons ansatz is not: it builds
++# V = g - softplus(.)*t*c <= g, which is the AVOID-direction constraint. On a
++# reach-avoid (brat_hjivi) system that structurally forces the wrong inequality,
++# so the "ours" model would be conservative in the unsafe direction.
++# exact_cons builds V = g - softplus(.)*t*c, i.e. V <= g. That is the AVOID
++# direction. On a REACH problem the our_loss inequality term flips to penalise
++# V < g, and its unique zero-loss optimum against the V <= g cap is the trivial
++# V = g -- which is exactly what LessLinearND (set_mode="reach") collapsed to:
++# max(V-g)=0.0000, frac(V<=0)=0, loss 5e-8. Block the combination outright rather
++# than let it silently train a degenerate model.
++if dynamics.deepReach_model == "exact_cons" and (
++        dynamics.loss_type != "brt_hjivi" or getattr(dynamics, "set_mode", "avoid") != "avoid"):
++    raise NotImplementedError(
++        f"--deepReach_model exact_cons enforces V <= g (the AVOID direction) and is "
++        f"not valid for {type(dynamics).__name__} (set_mode={dynamics.set_mode}, "
++        f"loss_type={dynamics.loss_type}). Against a reach-direction our_loss it has "
++        f"the degenerate optimum V = g. Use --deepReach_model exact."
++    )
++dynamics.our_loss_lambda_band = getattr(orig_opt, "our_loss_lambda_band", 0.0)
++dynamics.our_loss_sigma_band = getattr(orig_opt, "our_loss_sigma_band", 0.05)
++dynamics.our_loss_max_band_weight = getattr(orig_opt, "our_loss_max_band_weight", 20.0)
++dynamics.baseline_l1 = getattr(orig_opt, "baseline_l1", False)
++dynamics.baseline_l2 = getattr(orig_opt, "baseline_l2", False)
+ if mode == "test":
+     orig_opt.not_use_MPC = True
+     orig_opt.no_time_curr = True
+@@ -823,6 +939,9 @@ if (mode == "all") or (mode == "train"):
+         )
+     else:
+         raise NotImplementedError
++    experiment.lr_schedule = getattr(orig_opt, "lr_schedule", "none")
++    experiment.lr_warmup_steps = getattr(orig_opt, "lr_warmup_steps", 0)
++    experiment.lr_min_factor = getattr(orig_opt, "lr_min_factor", 0.01)
+     experiment.train(
+         batch_size=orig_opt.batch_size,
+         epochs=orig_opt.num_epochs,
+diff --git a/utils/losses.py b/utils/losses.py
+index c2a3c86..8df133b 100644
+--- a/utils/losses.py
++++ b/utils/losses.py
+@@ -111,9 +111,10 @@ def init_brt_hjivi_loss(
+ 
+         if torch.all(dirichlet_mask):  # pretraining loss
+             diff_constraint_hom = torch.Tensor([0]).to(device)
++            pde_res = diff_constraint_hom
+             if use_MPC and MPC_values.ndim > 1:
+                 dirichlet_loss += mpc_loss * 0.3
+-            elif dynamics.deepReach_model == "exact":
++            elif dynamics.deepReach_model in ("exact", "exact_cons"):
+                 dirichlet = output.squeeze(dim=-1)[dirichlet_mask] - 0.0
+                 dirichlet_loss = torch.abs(dirichlet).sum()
+         else:
+@@ -122,15 +123,139 @@ def init_brt_hjivi_loss(
+                 ham = torch.clamp(ham, max=0.0)
+ 
+             diff_constraint_hom = dvdt - ham
++            pde_res = diff_constraint_hom  # raw temporal residual (before target max)
+             if minWith == "target":
+                 diff_constraint_hom = torch.max(
+                     diff_constraint_hom, value - boundary_value
+                 )
+             # diff_constraint_hom = dvdt + ham # for FRS
+ 
++        # Norm held fixed at L2 across the ablation models so the ONLY difference
++        # between baseline and ours is the one-sided (relu) vs two-sided residual
++        # direction (P0-C.2). The verbatim published L1 baseline is still
++        # reachable via dynamics.baseline_l1 for the "vs published method" point.
++        # The residual r = dvdt - ham carries the system's value units, whose natural
++        # scale is value_var/value_normto: 25x for Air3D/Air6D/MultiVehicle9D but 106x
++        # for the Quadrotor. Every quadratic term below (the L2 baseline, relu(r)^2,
++        # min(r^2,.)) therefore sees a ~18x larger loss on the quadrotor, and every model
++        # diverged to NaN within ~2000 iterations. Upstream MADR avoids this only by
++        # using L1; our ablation needs a matched quadratic norm, so normalise the
++        # residual instead. Default 1.0 keeps every existing 25x run bit-identical.
++        _rn = float(getattr(dynamics, "residual_norm", 1.0))
++        if _rn != 1.0:
++            pde_res = pde_res / _rn
++            diff_constraint_hom = diff_constraint_hom / _rn
++
++        if getattr(dynamics, "our_loss", False):
++            # Full complementarity loss, matching scripts/configs/make_arm_configs.py:
++            #   w_ineq * ( relu(r_pde)^2 + relu(V-g)^2 )  +  w_act * min(r_pde^2, (V-g)^2)
++            # The inequality term alone (relu(r_pde)^2) drives toward a SUBSOLUTION but
++            # leaves an over-large tube unpenalised -- r_pde < 0 costs nothing. The
++            # active term is what keeps the tube tight, and omitting it understates the
++            # method. relu(V-g)^2 is identically 0 under exact_cons but is included so
++            # the loss is also correct for deepReach_model='exact'.
++            w_ineq = float(getattr(dynamics, "our_loss_ineq_weight", 1.0))
++            w_act = float(getattr(dynamics, "our_loss_active_weight", 1.2))
++            r_g = value - boundary_value
++            # Direction follows set_mode: avoid -> subsolution (relu(+r)) so the
++            # unsafe set is OVER-approximated; reach -> supersolution (relu(-r)) so
++            # the reachable set is UNDER-approximated. Both are "conservative", but
++            # they are opposite inequalities, and using the avoid sign on a reach
++            # system would make the model anti-conservative. Air3D/Air6D/9D/quadrotor
++            # are all avoid, so this leaves every existing result unchanged.
++            _d = getattr(dynamics, "our_loss_direction", None)
++            sgn = 1.0 if (_d or getattr(dynamics, "set_mode", "avoid")) == "avoid" else -1.0
++            # MARGIN (strict subsolution): penalise sgn*r_pde > -margin, i.e. train
++            # toward r <= -margin, so approximation error between collocation points
++            # has to eat through the slack before containment breaks. margin=0 is the
++            # original condition, bit-identical.
++            margin = float(getattr(dynamics, "our_loss_margin", 0.0))
++            # margin_consistent shifts the ACTIVE (and under) terms to the same
++            # target r = -margin the inequality term trains toward. Without it the
++            # active term still pulls r -> 0, fighting the margin inside the slack
++            # band; with it the zero-loss set is exactly the classical solutions of
++            # the margin-strictified VI max(r + margin, V - g) = 0, whose solution
++            # is sandwiched V* - margin*tau <= V_eps <= V* (comparison principle) --
++            # i.e. a TRUE subsolution in the training limit, conservatism bounded by
++            # margin*tau. Off (default) preserves the first sweep's semantics.
++            pde_t = pde_res + sgn * margin if (
++                margin > 0.0 and getattr(dynamics, "our_loss_margin_consistent", False)
++            ) else pde_res
++            ineq_pde = torch.relu(sgn * pde_res + margin)
++            ineq_g = torch.relu(sgn * r_g)
++            under = torch.relu(-sgn * pde_t)
++            # NORM: 'l2' squares every term (the original). A quadratic penalty's
++            # gradient vanishes as a violation approaches feasibility, so residual
++            # violations never fully close (frac(V<=V*) plateaus ~0.95); 'l1' keeps
++            # constant gradient pressure on any violation, and matches the norm the
++            # published DeepReach/MADR baseline residual trains with.
++            if getattr(dynamics, "our_loss_norm", "l2") == "l1":
++                ineq = ineq_pde + ineq_g
++                act = torch.minimum(pde_t.abs(), r_g.abs())
++            else:
++                ineq = ineq_pde.pow(2) + ineq_g.pow(2)
++                act = torch.minimum(pde_t.pow(2), r_g.pow(2))
++                under = under.pow(2)
++            point = w_ineq * ineq + w_act * act
++
++            # UNDER-APPROXIMATION penalty. Both relu terms above are one-sided, so a
++            # tube that is too SMALL (sgn*pde_res < 0) pays nothing at all -- there is
++            # no force in the objective pulling an under-grown tube back to size, and
++            # under-approximation is precisely the unsafe direction. Penalising
++            # relu(-sgn*pde_res)^2 with a SMALL weight pulls toward PDE equality while
++            # keeping the conservative bias, since violations still cost w_ineq >>
++            # w_under. Ported from src/lvfm/managers.py, where the term existed but
++            # was disabled in all 24 configs and was never wired into this stack at
++            # all -- so it has never been active in any reported result.
++            w_under = float(getattr(dynamics, "our_loss_under_weight", 0.0))
++            if w_under > 0.0:
++                point = point + w_under * under
++
++            # Boundary weighting: upweight points near the zero level set, where
++            # the tube boundary actually is. Matches LossManager._apply_point_weights.
++            lam_b = float(getattr(dynamics, "our_loss_lambda_band", 0.0))
++            if lam_b > 0.0:
++                sig_b = max(float(getattr(dynamics, "our_loss_sigma_band", 0.05)), 1e-8)
++                max_b = float(getattr(dynamics, "our_loss_max_band_weight", 20.0))
++                bw = (1.0 + lam_b * torch.exp(-value.detach().abs() / sig_b)).clamp(max=max_b)
++                point = point * bw
++            dch = point.sum()
++
++        elif getattr(dynamics, "baseline_l2", False):
++            # OPT-IN ablation only. Squaring the VI residual matches our loss's norm,
++            # which isolates one-sided vs two-sided -- but it is NOT what DeepReach or
++            # MADR publish, so it must never be the default for a baseline model.
++            # It was, for this entire study, which made every `vanilla`/`madr` number a
++            # comparison against a method nobody published; and because the residual is
++            # O(100) on the Quadrotor (value_var/value_normto = 106x vs 25x elsewhere),
++            # squaring it is also what made every quadrotor run diverge to NaN while
++            # upstream trained fine at loss 2392.
++            dch = diff_constraint_hom.pow(2).sum()
++        else:
++            # UPSTREAM DEFAULT: both DeepReach (utils/losses.py:24) and MADR
++            # (utils/losses.py:133) use the L1 residual.
++            dch = torch.abs(diff_constraint_hom).sum()
++
++        # gPINN (gradient-enhanced PDE loss). Applied to EVERY model, so it is shared
++        # training infrastructure rather than a treatment confounded with our_loss
++        # (a reviewer would otherwise ask how much of our gain is just gPINN).
++        # Penalises |d r_pde / dx|^2 so the residual is small in a NEIGHBOURHOOD of
++        # each collocation point, not just at it. In the archived LVFM runs this is the term that turned the
++        # conservative model into an actual over-approximation (FN 0.097 -> 0.000);
++        # the correction + complementarity loss alone did not.
++        gw = float(getattr(dynamics, "gpinn_weight", 0.0))
++        gin = getattr(dynamics, "_gpinn_input", None)
++        # pde_res is a constant during pretraining (dirichlet_mask all True),
++        # so it carries no graph then -- skip rather than error.
++        if (gw > 0.0 and gin is not None and gin.requires_grad
++                and pde_res.requires_grad):
++            drdi = torch.autograd.grad(pde_res.sum(), gin, create_graph=True,
++                                       retain_graph=True, allow_unused=True)[0]
++            if drdi is not None:
++                dch = dch + gw * drdi[..., 1:].pow(2).sum(-1).sum()
+         return {
+             "dirichlet": dirichlet_loss,
+-            "diff_constraint_hom": torch.abs(diff_constraint_hom).sum(),
++            "diff_constraint_hom": dch,
+             "mpc_loss": mpc_loss,
+         }
+ 
+@@ -211,6 +336,7 @@ def init_brat_hjivi_loss(
+ 
+         if torch.all(dirichlet_mask):  # pretraining loss
+             diff_constraint_hom = torch.Tensor([0]).to(device)
++            pde_res = diff_constraint_hom
+             if use_MPC:
+                 dirichlet_loss += mpc_loss * 0.3
+             elif dynamics.deepReach_model == "exact":
+@@ -222,15 +348,53 @@ def init_brat_hjivi_loss(
+                 ham = torch.clamp(ham, max=0.0)
+ 
+             diff_constraint_hom = dvdt - ham
++            pde_res = diff_constraint_hom  # raw residual, before the reach/avoid max-min
+             if minWith == "target":
+                 diff_constraint_hom = torch.min(
+                     torch.max(diff_constraint_hom, value - reach_value),
+                     value + avoid_value,
+                 )
+ 
++        if getattr(dynamics, "our_loss", False):
++            # Reach-avoid complementarity. The BRAT variational inequality is
++            #     min{ max{ r_pde, V - l }, V + g } = 0
++            # (l = reach/target fn, g = avoid/obstacle fn), so exactly ONE of the
++            # three branches is active at the solution. The active term is the
++            # three-way generalisation of min(r^2, (V-g)^2) from the BRT loss.
++            #
++            # DIRECTION FLIPS relative to the avoid BRT. There {V<=0} is the unsafe
++            # set and conservatism means OVER-approximating it, i.e. V_hat <= V, so
++            # we penalise relu(+r). Here {V<=0} is the set from which the goal can be
++            # safely reached, so conservatism means UNDER-approximating it, which
++            # needs V_hat >= V -- the supersolution side -- hence relu(-r). Getting
++            # this backwards would make the reach model anti-conservative, so it is a
++            # named option rather than a hidden constant.
++            w_ineq = float(getattr(dynamics, "our_loss_ineq_weight", 1.0))
++            w_act = float(getattr(dynamics, "our_loss_active_weight", 1.2))
++            sgn = -1.0 if getattr(dynamics, "our_loss_brat_direction", "under") == "under" else 1.0
++            r_l = value - reach_value
++            r_g = value + avoid_value
++            ineq = (torch.relu(sgn * pde_res).pow(2)
++                    + torch.relu(sgn * r_l).pow(2)
++                    + torch.relu(-sgn * r_g).pow(2))
++            act = torch.minimum(torch.minimum(pde_res.pow(2), r_l.pow(2)), r_g.pow(2))
++            dch = (w_ineq * ineq + w_act * act).sum()
++        else:
++            dch = torch.abs(diff_constraint_hom).sum()
++
++        # gPINN, identical to the BRT path and likewise applied to every model.
++        gw = float(getattr(dynamics, "gpinn_weight", 0.0))
++        gin = getattr(dynamics, "_gpinn_input", None)
++        if (gw > 0.0 and gin is not None and gin.requires_grad
++                and pde_res.requires_grad):
++            drdi = torch.autograd.grad(pde_res.sum(), gin, create_graph=True,
++                                       retain_graph=True, allow_unused=True)[0]
++            if drdi is not None:
++                dch = dch + gw * drdi[..., 1:].pow(2).sum(-1).sum()
++
+         return {
+             "dirichlet": dirichlet_loss,
+-            "diff_constraint_hom": torch.abs(diff_constraint_hom).sum(),
++            "diff_constraint_hom": dch,
+             "mpc_loss": mpc_loss,
+         }
+ 
